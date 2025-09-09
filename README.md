@@ -25,3 +25,6 @@ Danny is released to the public under the Public Domain license as a service to 
 
 ---
 Feel free to use Danny to make your day a little brighter!
+
+### Official GitHub Repository
+[https://github.com/ronblue77/danny](https://github.com/ronblue77/danny)
