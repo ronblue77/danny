@@ -1,0 +1,692 @@
+-- Chatbot Danny for Phix 32-bit
+-- Version 1.1.6.5 - 2021-2025
+-- Developed by Ronen Blumberg
+-- A conversational chatbot based on developer's friend Danny Shaul
+-- Modified to include prayer generation support
+-- Updated to isolate punctuation for better keyword matching
+
+include pGUI.e -- Phix GUI library
+
+-- ===========================================================================
+-- GLOBAL VARIABLES
+-- ===========================================================================
+sequence database_file = "database.txt"
+sequence word_swaps = {}
+sequence keyword_groups = {}
+sequence reply_groups = {}
+sequence default_replies = {}
+sequence conversation_log = {}
+
+-- Prayer-related variables
+sequence prayer_triggers = {}  -- c6: tags
+sequence prayer_part1 = {}      -- p1: tags
+sequence prayer_part2 = {}      -- p2: tags
+sequence prayer_part3 = {}      -- p3: tags
+sequence prayer_part4 = {}      -- p4: tags
+
+atom main_window, input_box, output_box, send_button, about_dialog
+integer use_tts = 1 -- Set to 0 to disable TTS
+
+-- ===========================================================================
+-- HELPER FUNCTIONS
+-- ===========================================================================
+
+-- Check if string starts with prefix
+function starts(sequence prefix, sequence str)
+    if length(prefix) > length(str) then
+        return 0
+    end if
+    return equal(str[1..length(prefix)], prefix)
+end function
+
+-- Trim whitespace from string
+function trim(sequence s)
+    integer start = 1
+    integer finish = length(s)
+    
+    while start <= finish and find(s[start], " \t\n\r") do
+        start += 1
+    end while
+    
+    while finish >= start and find(s[finish], " \t\n\r") do
+        finish -= 1
+    end while
+    
+    if start > finish then
+        return ""
+    end if
+    
+    return s[start..finish]
+end function
+
+-- Read file lines
+function read_lines(sequence filename)
+    integer fn = open(filename, "r")
+    if fn = -1 then
+        return -1
+    end if
+    
+    sequence lines = {}
+    object line
+    
+    while 1 do
+        line = gets(fn)
+        if atom(line) then
+            exit
+        end if
+        -- Remove newline characters
+        if length(line) and line[$] = '\n' then
+            line = line[1..$-1]
+        end if
+        if length(line) and line[$] = '\r' then
+            line = line[1..$-1]
+        end if
+        lines = append(lines, line)
+    end while
+    
+    close(fn)
+    return lines
+end function
+
+-- NEW FUNCTION: Isolate punctuation by adding spaces around them
+function isolate_punctuation(sequence text)
+    sequence result = ""
+    sequence punctuation = "?!<>,."
+    
+    for i = 1 to length(text) do
+        if find(text[i], punctuation) then
+            -- Add space before and after punctuation
+            if length(result) > 0 and result[$] != ' ' then
+                result &= " "
+            end if
+            result &= text[i]
+            result &= " "
+        else
+            result &= text[i]
+        end if
+    end for
+    
+    -- Clean up multiple spaces
+    sequence cleaned = ""
+    integer prev_space = 0
+    
+    for i = 1 to length(result) do
+        if result[i] = ' ' then
+            if not prev_space then
+                cleaned &= result[i]
+                prev_space = 1
+            end if
+        else
+            cleaned &= result[i]
+            prev_space = 0
+        end if
+    end for
+    
+    return cleaned
+end function
+
+-- ===========================================================================
+-- DATABASE FUNCTIONS
+-- ===========================================================================
+
+-- Load and parse the database
+procedure load_database()
+    sequence lines
+    object content = read_lines(database_file)
+    
+    if atom(content) then
+        IupMessage("Error", "Cannot load database.txt file!")
+        return
+    end if
+    
+    lines = content
+    integer mode = 0 -- 0=none, 1=swaps, 2=keywords, 3=replies
+    integer group_id = 0
+    
+    for i = 1 to length(lines) do
+        sequence line = trim(lines[i])
+        
+        -- Skip comments and empty lines
+        if length(line) = 0 or starts("###", line) or starts("===", line) then
+            continue
+        end if
+        
+        -- Check for word swaps
+        if starts("s:", line) then
+            integer pos = find('>', line)
+            if pos > 3 then
+                sequence part1 = trim(line[3..pos-1])
+                sequence part2 = trim(line[pos+1..$])
+                word_swaps = append(word_swaps, {part1, part2})
+            end if
+            
+        -- Check for keywords
+        elsif starts("k:", line) then
+            if mode != 2 then
+                -- Starting new keyword group
+                group_id += 1
+                keyword_groups = append(keyword_groups, {})
+                reply_groups = append(reply_groups, {})
+                mode = 2
+            end if
+            sequence keyword = " " & trim(line[3..$]) & " "  -- Add spaces before and after
+            keyword_groups[group_id] = append(keyword_groups[group_id], lower(keyword))
+            
+        -- Check for replies
+        elsif starts("r:", line) then
+            mode = 3
+            if group_id > 0 then
+                sequence reply = trim(line[3..$])
+                reply_groups[group_id] = append(reply_groups[group_id], reply)
+            end if
+            
+        -- Check for default replies (d1:)
+        elsif starts("d1:", line) then
+            sequence default_reply = trim(line[4..$])
+            default_replies = append(default_replies, default_reply)
+            
+        -- Check for prayer triggers (c6:)
+        elsif starts("c6:", line) then
+            sequence trigger = trim(line[4..$])
+            prayer_triggers = append(prayer_triggers, lower(trigger))
+            
+        -- Check for prayer parts
+        elsif starts("p1:", line) then
+            sequence prayer_text = trim(line[4..$])
+            prayer_part1 = append(prayer_part1, prayer_text)
+            
+        elsif starts("p2:", line) then
+            sequence prayer_text = trim(line[4..$])
+            prayer_part2 = append(prayer_part2, prayer_text)
+            
+        elsif starts("p3:", line) then
+            sequence prayer_text = trim(line[4..$])
+            prayer_part3 = append(prayer_part3, prayer_text)
+            
+        elsif starts("p4:", line) then
+            sequence prayer_text = trim(line[4..$])
+            prayer_part4 = append(prayer_part4, prayer_text)
+            
+        -- Special tags to ignore
+        elsif starts("c1:", line) or starts("c2:", line) or starts("c3:", line) or 
+              starts("c4:", line) or starts("c5:", line) or
+              starts("k1:", line) or starts("r1:", line) then
+            -- Ignore these special tags as mentioned in the database
+            continue
+        end if
+    end for
+    
+    printf(1, "Loaded %d word swaps, %d keyword groups, %d default replies\n", 
+           {length(word_swaps), length(keyword_groups), length(default_replies)})
+    printf(1, "Loaded %d prayer triggers, %d/%d/%d/%d prayer parts\n",
+           {length(prayer_triggers), length(prayer_part1), length(prayer_part2), 
+            length(prayer_part3), length(prayer_part4)})
+end procedure
+
+-- ===========================================================================
+-- CHATBOT LOGIC FUNCTIONS
+-- ===========================================================================
+
+-- Check if input contains prayer trigger
+function check_prayer_trigger(sequence input)
+    sequence lower_input = lower(input)
+    
+    for i = 1 to length(prayer_triggers) do
+        if match(prayer_triggers[i], lower_input) then
+            return 1
+        end if
+    end for
+    
+    return 0
+end function
+
+-- Generate a random prayer
+function generate_prayer()
+    sequence prayer = ""
+    
+    -- Select random parts from each prayer component
+    if length(prayer_part1) > 0 then
+        prayer = prayer_part1[rand(length(prayer_part1))]
+    end if
+    
+    if length(prayer_part2) > 0 then
+        if length(prayer) > 0 then
+            prayer &= " "
+        end if
+        prayer &= prayer_part2[rand(length(prayer_part2))]
+    end if
+    
+    if length(prayer_part3) > 0 then
+        if length(prayer) > 0 then
+            prayer &= " "
+        end if
+        prayer &= prayer_part3[rand(length(prayer_part3))]
+    end if
+    
+    if length(prayer_part4) > 0 then
+        if length(prayer) > 0 then
+            prayer &= " "
+        end if
+        prayer &= prayer_part4[rand(length(prayer_part4))]
+    end if
+    
+    return prayer
+end function
+
+-- Perform word swapping on input
+function swap_words(sequence text)
+    sequence result = text
+    for i = 1 to length(word_swaps) do
+        sequence find_word = word_swaps[i][1]
+        sequence replace_word = word_swaps[i][2]
+        
+        -- Simple word boundary check and replace
+        sequence words = {}
+        sequence current_word = ""
+        
+        for j = 1 to length(result) do
+            if find(result[j], " ,.!?;:\t\n") then
+                if length(current_word) then
+                    if equal(lower(current_word), lower(find_word)) then
+                        words = append(words, replace_word)
+                    else
+                        words = append(words, current_word)
+                    end if
+                    current_word = ""
+                end if
+                words = append(words, {result[j]})
+            else
+                current_word &= result[j]
+            end if
+        end for
+        
+        if length(current_word) then
+            if equal(lower(current_word), lower(find_word)) then
+                words = append(words, replace_word)
+            else
+                words = append(words, current_word)
+            end if
+        end if
+        
+        -- Rebuild the result
+        result = ""
+        for j = 1 to length(words) do
+            result &= words[j]
+        end for
+    end for
+    return result
+end function
+
+-- Find all matching keyword groups
+function find_all_keyword_matches(sequence input)
+    sequence lower_input = lower(input)
+    sequence matches = {}
+    
+    -- Check each keyword group
+    for g = 1 to length(keyword_groups) do
+        for k = 1 to length(keyword_groups[g]) do
+            sequence keyword = keyword_groups[g][k]
+            if match(keyword, lower_input) then
+                matches = append(matches, g)
+                exit -- Only add each group once
+            end if
+        end for
+    end for
+    
+    return matches
+end function
+
+-- Get random reply from group
+function get_reply(integer group_id, sequence processed_input, sequence original_input)
+    if group_id <= 0 or group_id > length(reply_groups) then
+        -- Return a default response from d1: entries if no match
+        if length(default_replies) > 0 then
+            return default_replies[rand(length(default_replies))]
+        else
+            -- Fallback if no d1: entries loaded
+            return "I understand."
+        end if
+    end if
+    
+    sequence replies = reply_groups[group_id]
+    if length(replies) = 0 then
+        -- Use d1: default if group has no replies
+        if length(default_replies) > 0 then
+            return default_replies[rand(length(default_replies))]
+        else
+            return "I understand."
+        end if
+    end if
+    
+    -- Select random reply
+    sequence reply = replies[rand(length(replies))]
+    
+    -- Handle asterisk replies (swap words in rest of input)
+    if length(reply) > 0 and reply[$] = '*' then
+        -- Try to find keyword in processed input first for better matching
+        sequence lower_processed = lower(processed_input)
+        integer keyword_pos = 0
+        
+        -- Find the keyword in the processed input
+        for k = 1 to length(keyword_groups[group_id]) do
+            sequence keyword = keyword_groups[group_id][k]  -- Already has spaces
+            integer pos = match(keyword, lower_processed)
+            if pos > 0 then
+                -- Found in processed input, now find corresponding position in original
+                -- Count non-space characters up to this position
+                keyword_pos = pos + length(keyword) - 2  -- Adjust for added spaces
+                exit
+            end if
+        end for
+        
+        -- If we found a keyword position, extract the rest from original input
+        if keyword_pos > 0 then
+            -- Find the actual position in the original input
+            sequence lower_original = lower(original_input)
+            for k = 1 to length(keyword_groups[group_id]) do
+                sequence keyword = trim(keyword_groups[group_id][k])
+                integer pos = match(keyword, lower_original)
+                if pos > 0 then
+                    keyword_pos = pos + length(keyword)
+                    exit
+                end if
+            end for
+            
+            if keyword_pos > 0 and keyword_pos < length(original_input) then
+                sequence rest = trim(original_input[keyword_pos..$])
+                rest = swap_words(rest)
+                reply = reply[1..$-1] & " " & rest
+            else
+                reply = reply[1..$-1]
+            end if
+        else
+            reply = reply[1..$-1]
+        end if
+    end if
+    
+    return reply
+end function
+
+-- Process user input with multiple replies
+function process_input(sequence input)
+    input = trim(input)
+    if length(input) = 0 then
+        return ""
+    end if
+    
+    -- Store original input before punctuation isolation
+    sequence original_input = input
+    
+    -- First check for prayer triggers (on original input)
+    if check_prayer_trigger(original_input) then
+        return generate_prayer()
+    end if
+    
+    -- Isolate punctuation for better keyword matching
+    input = isolate_punctuation(input)
+    
+    -- Add one space before and after input
+    input = " " & input & " "
+    
+    -- Find all matching keyword groups
+    sequence matches = find_all_keyword_matches(input)
+    
+    if length(matches) = 0 then
+        -- No matches, return default response
+        return get_reply(0, input, original_input)
+    elsif length(matches) > 6 then
+        -- Too many matches, pick one random group
+        integer random_group = matches[rand(length(matches))]
+        return get_reply(random_group, input, original_input)
+    else
+        -- 1 to 6 matches, return multiple replies
+        sequence combined_reply = ""
+        
+        for i = 1 to length(matches) do
+            sequence reply = get_reply(matches[i], input, original_input)
+            
+            -- Add reply with proper punctuation and spacing
+            if length(combined_reply) > 0 then
+                -- Check if previous reply ends with punctuation
+                if not find(combined_reply[$], ".!?") then
+                    combined_reply &= "."
+                end if
+                combined_reply &= " "
+            end if
+            
+            combined_reply &= reply
+        end for
+        
+        return combined_reply
+    end if
+end function
+
+-- ===========================================================================
+-- TEXT-TO-SPEECH FUNCTION
+-- ===========================================================================
+
+-- Speak text using voice.exe
+procedure speak(sequence text)
+    if use_tts and length(text) > 0 then
+        -- Remove special characters that might cause issues
+        text = substitute_all(text, {"\"", "'", "\n"}, {"", "", " "})
+        -- Use Microsoft David Desktop voice (male voice)
+        system(sprintf("voice.exe -r -1 -n \"Microsoft David Desktop\" -q \"%s\"", {text}), 2)
+    end if
+end procedure
+
+-- ===========================================================================
+-- GUI ACTION FUNCTIONS
+-- ===========================================================================
+
+-- Process send action (shared logic)
+procedure do_send()
+    sequence input = IupGetAttribute(input_box, "VALUE")
+    
+    if length(trim(input)) = 0 then
+        return
+    end if
+    
+    -- Add user input to conversation
+    sequence current_text = IupGetAttribute(output_box, "VALUE")
+    current_text &= sprintf("You: %s\n", {input})
+    
+    -- Process and get response
+    sequence response = process_input(input)
+    current_text &= sprintf("Danny: %s\n\n", {response})
+    
+    -- Update output box
+    IupSetAttribute(output_box, "VALUE", current_text)
+    
+    -- Auto-scroll to bottom - set caret position to end
+    IupSetAttribute(output_box, "CARETPOS", sprintf("%d", {length(current_text)}))
+    IupSetAttribute(output_box, "SCROLLTOPOS", sprintf("%d", {length(current_text)}))
+    
+    -- Clear input box
+    IupSetAttribute(input_box, "VALUE", "")
+    
+    -- Set focus back to input box for convenience
+    IupSetFocus(input_box)
+    
+    -- Speak the response
+    speak(response)
+    
+    -- Save to log
+    conversation_log = append(conversation_log, {input, response})
+end procedure
+
+-- ===========================================================================
+-- GUI CALLBACK FUNCTIONS
+-- ===========================================================================
+
+-- GUI callback for send button
+function on_send(Ihandle ih)
+    do_send()
+    return IUP_DEFAULT
+end function
+
+-- GUI callback for enter key in input box
+function on_enter_key(Ihandle ih, atom c)
+    if c = K_CR then
+        do_send()
+        return IUP_DEFAULT
+    end if
+    return IUP_DEFAULT
+end function
+
+-- GUI callback to close About dialog
+function close_about(Ihandle ih)
+    if about_dialog != NULL and about_dialog != 0 then
+        IupHide(about_dialog)
+    end if
+    return IUP_DEFAULT
+end function
+
+-- GUI callback for About menu item
+function on_about(Ihandle ih)
+    -- Create the about dialog if it doesn't exist
+    if about_dialog = NULL or about_dialog = 0 then
+        sequence about_text = 
+            "Chatbot Danny\n" &
+            "Version 1.1.6.5 - 2021-2025\n\n" &
+            "Developed by - Ronen Blumberg\n\n" &
+            "A conversational chatbot with database file\n" &
+            "based on the developer's friend Danny Shaul\n\n" &
+            "Made as a homage to Danny and his friendship\n\n" &
+            "Now includes prayer generation support\n" &
+            "and improved punctuation handling\n\n" &
+            "Public Domain License App"
+        
+        Ihandle about_label = IupLabel(about_text)
+        IupSetAttribute(about_label, "PADDING", "20x20")
+        IupSetAttribute(about_label, "FONT", "Arial, 12")
+        
+        Ihandle ok_button = IupButton("OK", NULL)
+        IupSetAttribute(ok_button, "PADDING", "20x5")
+        IupSetCallback(ok_button, "ACTION", Icallback("close_about"))
+        
+        Ihandle button_box = IupHbox({IupFill(), ok_button, IupFill()})
+        
+        Ihandle about_vbox = IupVbox({about_label, button_box})
+        IupSetAttribute(about_vbox, "MARGIN", "10x10")
+        IupSetAttribute(about_vbox, "GAP", "10")
+        
+        about_dialog = IupDialog(about_vbox)
+        IupSetAttribute(about_dialog, "TITLE", "About Chatbot Danny")
+        IupSetAttribute(about_dialog, "SIZE", "350x240")
+        IupSetAttribute(about_dialog, "RESIZE", "NO")
+        IupSetAttribute(about_dialog, "DIALOGFRAME", "YES")
+        IupSetAttributeHandle(about_dialog, "PARENTDIALOG", main_window)
+    end if
+    
+    -- Show the about dialog
+    IupPopup(about_dialog, IUP_CENTER, IUP_CENTER)
+    
+    return IUP_DEFAULT
+end function
+
+-- GUI callback for Exit menu item
+function on_exit(Ihandle ih)
+    return IUP_CLOSE
+end function
+
+-- ===========================================================================
+-- GUI CREATION
+-- ===========================================================================
+
+-- Create GUI
+procedure create_gui()
+    IupOpen()
+    
+    -- Initialize about dialog to NULL
+    about_dialog = NULL
+    
+    -- Create menu items
+    Ihandle menu_about = IupItem("&About\tCtrl+A", NULL)
+    IupSetCallback(menu_about, "ACTION", Icallback("on_about"))
+    
+    Ihandle menu_exit = IupItem("E&xit\tCtrl+Q", NULL)
+    IupSetCallback(menu_exit, "ACTION", Icallback("on_exit"))
+    
+    -- Create menus
+    Ihandle file_menu = IupMenu({menu_exit})
+    Ihandle help_menu = IupMenu({menu_about})
+    
+    -- Create submenus
+    Ihandle sub_file = IupSubmenu("&File", file_menu)
+    Ihandle sub_help = IupSubmenu("&Help", help_menu)
+    
+    -- Create menu bar
+    Ihandle menu_bar = IupMenu({sub_file, sub_help})
+    
+    -- Create widgets
+    output_box = IupText()
+    IupSetAttribute(output_box, "MULTILINE", "YES")
+    IupSetAttribute(output_box, "EXPAND", "YES")
+    IupSetAttribute(output_box, "READONLY", "YES")
+    IupSetAttribute(output_box, "VISIBLELINES", "20")
+    IupSetAttribute(output_box, "VISIBLECOLUMNS", "80")
+    IupSetAttribute(output_box, "FONT", "Courier, 14")
+    IupSetAttribute(output_box, "WORDWRAP", "YES")
+    IupSetAttribute(output_box, "SCROLLBAR", "YES")
+    IupSetAttribute(output_box, "AUTOHIDE", "NO")
+    
+    input_box = IupText()
+    IupSetAttribute(input_box, "EXPAND", "HORIZONTAL")
+    IupSetAttribute(input_box, "VISIBLECOLUMNS", "60")
+    IupSetAttribute(input_box, "FONT", "Courier, 14")
+    IupSetCallback(input_box, "K_ANY", Icallback("on_enter_key"))
+    
+    send_button = IupButton("Send", NULL)
+    IupSetAttribute(send_button, "FONT", "Arial, 12")
+    IupSetAttribute(send_button, "PADDING", "10x5")
+    IupSetCallback(send_button, "ACTION", Icallback("on_send"))
+    
+    -- Create layout
+    Ihandle input_line = IupHbox({input_box, send_button})
+    IupSetAttribute(input_line, "ALIGNMENT", "ACENTER")
+    IupSetAttribute(input_line, "GAP", "10")
+    
+    Ihandle vbox = IupVbox({output_box, input_line})
+    IupSetAttribute(vbox, "GAP", "10")
+    IupSetAttribute(vbox, "MARGIN", "10x10")
+    
+    -- Create main window
+    main_window = IupDialog(vbox)
+    IupSetAttribute(main_window, "TITLE", "Chatbot Danny")
+    IupSetAttribute(main_window, "SIZE", "700x500")
+    IupSetAttribute(main_window, "MINSIZE", "650x400")
+    IupSetAttributeHandle(main_window, "MENU", menu_bar)
+    
+    -- Show initial message
+    sequence welcome = "Danny: Hello there, how are you doing today?\n\n"
+    IupSetAttribute(output_box, "VALUE", welcome)
+    speak("Hello there, how are you doing today?")
+    
+    -- Show window
+    IupShow(main_window)
+    
+    -- Set focus to input box
+    IupSetFocus(input_box)
+end procedure
+
+-- ===========================================================================
+-- MAIN PROGRAM
+-- ===========================================================================
+
+procedure main()
+    -- Load database
+    load_database()
+    
+    -- Create and run GUI
+    create_gui()
+    
+    -- Main loop
+    IupMainLoop()
+    
+    -- Cleanup
+    IupClose()
+end procedure
+
+-- Run the program
+main()
